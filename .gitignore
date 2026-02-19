@@ -1,0 +1,17 @@
+/blib/
+/pm_to_blib
+/Makefile
+/Makefile.old
+/MYMETA.json
+/MYMETA.yml
+/Websockets.c
+/Websockets.o
+/Websockets.bs
+/Websockets.xsc
+*.so
+*.o
+*.bs
+*.tar
+*.tar.gz
+*.bak
+EV-Websockets-*/
