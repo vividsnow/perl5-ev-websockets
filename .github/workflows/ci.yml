@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  test-linux-macos:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        perl-version: ['5.38', '5.40']
+
+    steps:
+    - name: Checkout EV-Websockets
+      uses: actions/checkout@v4
+      with:
+        path: EV-Websockets
+
+    - name: Checkout Alien-libwebsockets
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.repository_owner }}/perl5-alien-libwebsockets
+        path: Alien-libwebsockets
+
+    - name: Set up Perl
+      uses: shogo82148/actions-setup-perl@v1
+      with:
+        perl-version: ${{ matrix.perl-version }}
+
+    - name: Install System Dependencies (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake libev-dev libssl-dev zlib1g-dev libcap-dev pkg-config
+
+    - name: Install System Dependencies (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        brew install cmake libev openssl@3
+
+    - name: Install Perl Dependencies
+      run: |
+        cpanm --notest Alien::Build Alien::cmake3 Alien::Base::Wrapper \
+          Sort::Versions Mojo::DOM58 URI \
+          ExtUtils::MakeMaker EV::MakeMaker \
+          AnyEvent AnyEvent::WebSocket::Server
+
+    - name: Build and Install Alien::libwebsockets
+      env:
+        ALIEN_INSTALL_TYPE: share
+      run: |
+        cd Alien-libwebsockets
+        if [ "$RUNNER_OS" = "macOS" ]; then
+          OPENSSL_PREFIX=$(brew --prefix openssl@3)
+          export OPENSSL_ROOT_DIR=$OPENSSL_PREFIX
+          export CMAKE_PREFIX_PATH=$OPENSSL_PREFIX
+          # Bake OpenSSL rpath into lws so it finds libssl at runtime
+          export CMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath,$OPENSSL_PREFIX/lib"
+        fi
+        perl Makefile.PL
+        make
+        make install
+
+    - name: Build and Test EV::Websockets
+      run: |
+        cd EV-Websockets
+        if [ "$RUNNER_OS" = "macOS" ]; then
+          OPENSSL_PREFIX=$(brew --prefix openssl@3)
+          export C_INCLUDE_PATH="${OPENSSL_PREFIX}/include"
+          export LIBRARY_PATH="${OPENSSL_PREFIX}/lib"
+        fi
+        perl Makefile.PL
+        make
+        make test
+
+  test-freebsd:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout EV-Websockets
+      uses: actions/checkout@v4
+      with:
+        path: EV-Websockets
+
+    - name: Checkout Alien-libwebsockets
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.repository_owner }}/perl5-alien-libwebsockets
+        path: Alien-libwebsockets
+
+    - name: Test on FreeBSD
+      uses: vmactions/freebsd-vm@v1
+      with:
+        usesh: true
+        prepare: |
+          pkg install -y cmake libev openssl perl5 p5-App-cpanminus p5-EV p5-AnyEvent p5-Net-SSLeay p5-IO-Socket-SSL
+        run: |
+          cpanm --notest Alien::Build Alien::cmake3 Alien::Base::Wrapper \
+            Sort::Versions Mojo::DOM58 URI \
+            EV::MakeMaker \
+            AnyEvent::WebSocket::Server
+
+          cd Alien-libwebsockets
+          ALIEN_INSTALL_TYPE=share perl Makefile.PL
+          make
+          make install
+          cd ..
+
+          cd EV-Websockets
+          perl Makefile.PL
+          make
+          LWS_LIB=$(perl -MAlien::libwebsockets -e 'print Alien::libwebsockets->dist_dir . "/lib"')
+          LD_LIBRARY_PATH="$LWS_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" make test

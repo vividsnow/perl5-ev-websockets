@@ -1,0 +1,8 @@
+Revision history for EV::Websockets
+
+0.01    2026-02-20
+        - Initial release.
+        - Full WebSocket client and server support.
+        - Manual libwebsockets integration with EV loop.
+        - High-performance idle polling optimization.
+        - Support for custom headers and handle adoption.

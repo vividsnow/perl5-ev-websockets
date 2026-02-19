@@ -1,0 +1,22 @@
+NAME
+    EV::Websockets - WebSocket client/server using libwebsockets and EV
+
+SYNOPSIS
+    See lib/EV/Websockets.pm for full documentation and usage examples.
+
+INSTALLATION
+    To install this module, run the following commands:
+
+        perl Makefile.PL
+        make
+        make test
+        make install
+
+DEPENDENCIES
+    This module requires:
+    - EV
+    - Alien::libwebsockets (v4.3.3+)
+
+LICENSE
+    This library is free software; you can redistribute it and/or modify
+    it under the same terms as Perl itself.
