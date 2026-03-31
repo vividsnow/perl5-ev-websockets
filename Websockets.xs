@@ -31,6 +31,7 @@ typedef struct ev_ws_server_s {
     SV* on_error;
     SV* on_pong;
     SV* on_drain;
+    SV* on_handshake;
     HV* response_headers; /* headers to inject into upgrade response */
     size_t max_message_size;
     char* protocol_name;
@@ -115,6 +116,12 @@ struct ev_ws_conn_s {
     int connect_timer_active;
     struct ev_loop* loop;
 
+    /* Fragmented send state */
+    int in_fragmented_send;
+
+    /* Per-connection metadata */
+    HV* stash;
+
     /* State */
     int connected;
     int closing;
@@ -138,6 +145,7 @@ static int ev_ws_debug = 0;
 
 /* Hack to track adoption during synchronous callbacks */
 static ev_ws_conn_t* pending_adoption = NULL;
+static HV* handshake_headers_map = NULL; /* wsi-ptr → per-conn response headers HV */
 static int ev_ws_ssl_inited = 0;
 
 /* Capture a header value into an HV, dynamically allocating if needed */
@@ -155,6 +163,49 @@ static void capture_header(struct lws *wsi, HV *hv, enum lws_token_indexes tok,
                 SvREFCNT_dec(val);
         }
         Safefree(buf);
+    }
+}
+
+typedef struct { enum lws_token_indexes tok; const char *name; STRLEN nlen; } header_def_t;
+
+static const header_def_t request_hdrs[] = {
+    { WSI_TOKEN_GET_URI, "Path", 4 },
+    { WSI_TOKEN_HOST, "Host", 4 },
+    { WSI_TOKEN_ORIGIN, "Origin", 6 },
+    { WSI_TOKEN_HTTP_COOKIE, "Cookie", 6 },
+    { WSI_TOKEN_HTTP_AUTHORIZATION, "Authorization", 13 },
+    { WSI_TOKEN_PROTOCOL, "Sec-WebSocket-Protocol", 22 },
+    { WSI_TOKEN_HTTP_USER_AGENT, "User-Agent", 10 },
+    { WSI_TOKEN_X_FORWARDED_FOR, "X-Forwarded-For", 15 },
+};
+#define N_REQUEST_HDRS (int)(sizeof(request_hdrs)/sizeof(request_hdrs[0]))
+
+static void capture_request_headers(struct lws *wsi, HV *hv) {
+    int i;
+    for (i = 0; i < N_REQUEST_HDRS; i++)
+        capture_header(wsi, hv, request_hdrs[i].tok,
+                       request_hdrs[i].name, request_hdrs[i].nlen);
+}
+
+/* Inject all key/value pairs from an HV as HTTP headers via lws */
+static void inject_headers(struct lws *wsi, HV *hv,
+                           unsigned char **p, unsigned char *end) {
+    HE *entry;
+    char kbuf[256];
+    hv_iterinit(hv);
+    while ((entry = hv_iternext(hv))) {
+        I32 klen;
+        const char *key = hv_iterkey(entry, &klen);
+        SV *val_sv = hv_iterval(hv, entry);
+        STRLEN vlen;
+        const char *val = SvPV(val_sv, vlen);
+        if (klen >= 254) continue;
+        memcpy(kbuf, key, klen);
+        kbuf[klen] = ':';
+        kbuf[klen + 1] = '\0';
+        if (lws_add_http_header_by_name(wsi, (unsigned char *)kbuf,
+                (unsigned char *)val, vlen, p, end))
+            break;
     }
 }
 
@@ -393,6 +444,8 @@ static void free_conn_resources(ev_ws_conn_t* conn) {
         conn->response_headers = NULL;
     }
 
+    if (conn->stash) { SvREFCNT_dec((SV*)conn->stash); conn->stash = NULL; }
+
     if (conn->adopted_fh) { SvREFCNT_dec(conn->adopted_fh); conn->adopted_fh = NULL; }
 
     if (conn->recv_buf) { Safefree(conn->recv_buf); conn->recv_buf = NULL; conn->recv_alloc = 0; }
@@ -522,6 +575,7 @@ static void add_fd_watcher(ev_ws_ctx_t* ctx, int fd, int events) {
     ev_ws_fd_t* fdw;
     int ev_events = 0;
 
+    if (fd < 0) return;
     if (fd >= ctx->fd_table_size) fd_table_grow(ctx, fd);
 
     fdw = ctx->fd_table[fd];
@@ -562,7 +616,8 @@ static void change_fd_watcher(ev_ws_ctx_t* ctx, int fd, int events) {
     ev_ws_fd_t* fdw;
     int ev_events = 0;
 
-    if (fd < 0 || fd >= ctx->fd_table_size) {
+    if (fd < 0) return;
+    if (fd >= ctx->fd_table_size) {
         add_fd_watcher(ctx, fd, events);
         return;
     }
@@ -623,6 +678,7 @@ static int ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
         DEBUG_LOG("Associating pending adoption: conn=%p", pending_adoption);
         lws_set_wsi_user(wsi, pending_adoption);
         conn = pending_adoption;
+        if (!conn->wsi) conn->wsi = wsi;
     }
 
     if (ctx && ctx->magic != EV_WS_CTX_MAGIC) {
@@ -726,6 +782,55 @@ static int ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
             break;
         }
 
+        case LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION: {
+            struct lws_vhost *vh = lws_get_vhost(wsi);
+            ev_ws_server_t *srv = vh ? (ev_ws_server_t *)lws_get_vhost_user(vh) : NULL;
+            if (srv && srv->magic == EV_WS_SRV_MAGIC && srv->on_handshake) {
+                HV *hdrs = newHV();
+                int count;
+                SV *result;
+                capture_request_headers(wsi, hdrs);
+
+                dSP;
+                ENTER;
+                SAVETMPS;
+                PUSHMARK(SP);
+                XPUSHs(sv_2mortal(newRV_noinc((SV*)hdrs)));
+                PUTBACK;
+                sv_setsv(ERRSV, &PL_sv_undef);
+                count = call_sv(srv->on_handshake, G_SCALAR | G_EVAL);
+                SPAGAIN;
+                if (SvTRUE(ERRSV)) {
+                    warn("EV::Websockets: exception in on_handshake: %s", SvPV_nolen(ERRSV));
+                    if (count) POPs;
+                    PUTBACK;
+                    FREETMPS;
+                    LEAVE;
+                    return -1;
+                }
+                result = count ? POPs : &PL_sv_undef;
+                if (!SvTRUE(result)) {
+                    PUTBACK;
+                    FREETMPS;
+                    LEAVE;
+                    return -1;
+                }
+                if (SvROK(result) && SvTYPE(SvRV(result)) == SVt_PVHV) {
+                    char key[32];
+                    int klen = snprintf(key, sizeof(key), "%p", (void*)wsi);
+                    SV *val = newRV_inc(SvRV(result));
+                    if (!handshake_headers_map)
+                        handshake_headers_map = newHV();
+                    if (!hv_store(handshake_headers_map, key, klen, val, 0))
+                        SvREFCNT_dec(val);
+                }
+                PUTBACK;
+                FREETMPS;
+                LEAVE;
+            }
+            break;
+        }
+
         /* Connection callbacks */
         case LWS_CALLBACK_ESTABLISHED:
             if (!conn) {
@@ -747,23 +852,7 @@ static int ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
                     c->on_drain = srv->on_drain ? SvREFCNT_inc(srv->on_drain) : NULL;
 
                     c->response_headers = newHV();
-                    {
-                        static const struct { enum lws_token_indexes tok; const char *name; STRLEN nlen; } req_hdrs[] = {
-                            { WSI_TOKEN_GET_URI, "Path", 4 },
-                            { WSI_TOKEN_HOST, "Host", 4 },
-                            { WSI_TOKEN_ORIGIN, "Origin", 6 },
-                            { WSI_TOKEN_HTTP_COOKIE, "Cookie", 6 },
-                            { WSI_TOKEN_HTTP_AUTHORIZATION, "Authorization", 13 },
-                            { WSI_TOKEN_PROTOCOL, "Sec-WebSocket-Protocol", 22 },
-                            { WSI_TOKEN_HTTP_USER_AGENT, "User-Agent", 10 },
-                            { WSI_TOKEN_X_FORWARDED_FOR, "X-Forwarded-For", 15 },
-                        };
-                        int hi;
-                        for (hi = 0; hi < (int)(sizeof(req_hdrs)/sizeof(req_hdrs[0])); hi++) {
-                            capture_header(wsi, c->response_headers, req_hdrs[hi].tok,
-                                           req_hdrs[hi].name, req_hdrs[hi].nlen);
-                        }
-                    }
+                    capture_request_headers(wsi, c->response_headers);
 
                     lws_set_wsi_user(wsi, c);
                     conn = c;
@@ -785,30 +874,19 @@ static int ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
             break;
 
         case LWS_CALLBACK_ADD_HEADERS: {
+            struct lws_process_html_args *args = (struct lws_process_html_args *)in;
+            unsigned char *p_end = (unsigned char *)args->p + args->max_len;
             struct lws_vhost *vh = lws_get_vhost(wsi);
             ev_ws_server_t *srv = vh ? (ev_ws_server_t *)lws_get_vhost_user(vh) : NULL;
-            if (srv && srv->magic == EV_WS_SRV_MAGIC && srv->response_headers) {
-                struct lws_process_html_args *args = (struct lws_process_html_args *)in;
-                unsigned char *p_end = (unsigned char *)args->p + args->max_len;
-                HE *entry;
-                char kbuf[256];
-                hv_iterinit(srv->response_headers);
-                while ((entry = hv_iternext(srv->response_headers))) {
-                    I32 klen;
-                    const char *key = hv_iterkey(entry, &klen);
-                    SV *val_sv = hv_iterval(srv->response_headers, entry);
-                    STRLEN vlen;
-                    const char *val = SvPV(val_sv, vlen);
-                    int rc;
-                    if (klen >= 254) continue;
-                    memcpy(kbuf, key, klen);
-                    kbuf[klen] = ':';
-                    kbuf[klen + 1] = '\0';
-                    rc = lws_add_http_header_by_name(wsi, (unsigned char *)kbuf,
-                        (unsigned char *)val, vlen,
-                        (unsigned char **)&args->p, p_end);
-                    if (rc) break;
-                }
+            if (srv && srv->magic == EV_WS_SRV_MAGIC && srv->response_headers)
+                inject_headers(wsi, srv->response_headers,
+                               (unsigned char **)&args->p, p_end);
+            if (handshake_headers_map) {
+                char key[32];
+                int klen = snprintf(key, sizeof(key), "%p", (void*)wsi);
+                SV *val = hv_delete(handshake_headers_map, key, klen, 0);
+                if (val && SvROK(val) && SvTYPE(SvRV(val)) == SVt_PVHV)
+                    inject_headers(wsi, (HV*)SvRV(val), (unsigned char **)&args->p, p_end);
             }
             break;
         }
@@ -875,10 +953,6 @@ static int ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
             if (conn && conn->magic == EV_WS_CONN_MAGIC) {
                 ev_ws_send_t* send;
                 int n;
-                if (conn->closing) {
-                    DEBUG_LOG("Closing connection via writeable callback");
-                    return -1;
-                }
                 while (conn->send_head) {
                     send = conn->send_head;
                     DEBUG_LOG("Writing data: len=%zu mode=%d", send->len, (int)send->write_mode);
@@ -907,6 +981,10 @@ static int ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
                         lws_callback_on_writable(wsi);
                         break;
                     }
+                }
+                if (conn->closing && conn->send_head == NULL) {
+                    DEBUG_LOG("Closing connection via writeable callback");
+                    return -1;
                 }
                 if (conn->send_head == NULL && conn->on_drain) {
                     conn_ref(conn);
@@ -985,6 +1063,7 @@ static int ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
                         if (srv->on_error)   SvREFCNT_dec(srv->on_error);
                         if (srv->on_pong)    SvREFCNT_dec(srv->on_pong);
                         if (srv->on_drain)   SvREFCNT_dec(srv->on_drain);
+                        if (srv->on_handshake) SvREFCNT_dec(srv->on_handshake);
                         if (srv->response_headers) SvREFCNT_dec((SV*)srv->response_headers);
                         if (srv->protocol_name) Safefree(srv->protocol_name);
                     }
@@ -995,6 +1074,11 @@ static int ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
         }
 
         case LWS_CALLBACK_WSI_DESTROY:
+            if (handshake_headers_map) {
+                char key[32];
+                int klen = snprintf(key, sizeof(key), "%p", (void*)wsi);
+                hv_delete(handshake_headers_map, key, klen, G_DISCARD);
+            }
             if (conn && conn->magic == EV_WS_CONN_MAGIC) {
                 DEBUG_LOG("WSI destroyed: conn=%p", conn);
                 conn->wsi = NULL;
@@ -1046,7 +1130,7 @@ CODE:
 MODULE = EV::Websockets  PACKAGE = EV::Websockets::Context
 
 EV::Websockets::Context
-_new(char* class, EV::Loop loop, const char* proxy = NULL, int proxy_port = 0, const char* ssl_cert = NULL, const char* ssl_key = NULL, const char* ssl_ca = NULL);
+_new(char* class, EV::Loop loop, const char* proxy = NULL, int proxy_port = 0, const char* ssl_cert = NULL, const char* ssl_key = NULL, const char* ssl_ca = NULL, int ssl_init = -1);
 CODE:
 {
     struct lws_context_creation_info info;
@@ -1068,7 +1152,9 @@ CODE:
 #endif
     info.gid = -1;
     info.uid = -1;
-    info.options = ev_ws_ssl_inited ? 0 : LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+    if (ssl_init == -1)
+        ssl_init = ev_ws_ssl_inited ? 0 : 1;
+    info.options = ssl_init ? LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT : 0;
     info.user = RETVAL;
     info.foreign_loops = foreign_loops;
     info.vhost_name = "default";
@@ -1093,8 +1179,8 @@ CODE:
         Safefree(RETVAL);
         croak("Failed to create libwebsockets context");
     }
-    ev_ws_ssl_inited = 1;
-
+    if (ssl_init)
+        ev_ws_ssl_inited = 1;
     ev_timer_init(&RETVAL->timer, timer_cb, 0.00001, 0.);
     RETVAL->timer.data = (void*)RETVAL;
 
@@ -1155,6 +1241,7 @@ PREINIT:
     const char* url = NULL;
     const char* protocol = NULL;
     char* host = NULL;
+    char* host_header = NULL; /* for IPv6: "[::1]" form */
     char* path = NULL;
     int port = 80;
     int use_ssl = 0;
@@ -1260,10 +1347,19 @@ CODE:
     if (host[0] == '[') {
         p = strchr(host, ']');
         if (p) {
+            size_t iplen = p - host - 1;
+            int hport = 0;
             host++;    /* skip '[' */
+            if (*(p + 1) == ':') {
+                hport = atoi(p + 2);
+                port = hport;
+            }
             *p = '\0'; /* terminate IPv6 address */
-            if (*(p + 1) == ':')
-                port = atoi(p + 2);
+            Newx(host_header, iplen + 10, char); /* [addr]:port\0 */
+            if (hport && hport != (use_ssl ? 443 : 80))
+                snprintf(host_header, iplen + 10, "[%s]:%d", host, hport);
+            else
+                snprintf(host_header, iplen + 10, "[%s]", host);
         }
     } else {
         p = strchr(host, ':');
@@ -1292,8 +1388,8 @@ CODE:
     ccinfo.address = host;
     ccinfo.port = port;
     ccinfo.path = path;
-    ccinfo.host = host;
-    ccinfo.origin = host;
+    ccinfo.host = host_header ? host_header : host;
+    ccinfo.origin = host_header ? host_header : host;
     ccinfo.protocol = protocol;
 #ifdef LWS_HAS_EXTENSIONS
     ccinfo.client_exts = extensions;
@@ -1308,6 +1404,7 @@ CODE:
     RETVAL->wsi = lws_client_connect_via_info(&ccinfo);
 
     Safefree(path);
+    if (host_header) Safefree(host_header);
     Safefree(url_copy);
 
     if (RETVAL->wsi == NULL) {
@@ -1348,6 +1445,7 @@ PREINIT:
     SV* on_error = NULL;
     SV* on_pong = NULL;
     SV* on_drain = NULL;
+    SV* on_handshake = NULL;
     SV* headers_hv = NULL;
     size_t max_message_size = 0;
     const char *protocol_name = NULL;
@@ -1393,6 +1491,8 @@ CODE:
             on_pong = SvREFCNT_inc(val);
         } else if (strcmp(key, "on_drain") == 0 && SvROK(val) && SvTYPE(SvRV(val)) == SVt_PVCV) {
             on_drain = SvREFCNT_inc(val);
+        } else if (strcmp(key, "on_handshake") == 0 && SvROK(val) && SvTYPE(SvRV(val)) == SVt_PVCV) {
+            on_handshake = SvREFCNT_inc(val);
         }
     }
 
@@ -1403,6 +1503,7 @@ CODE:
         if (on_error) SvREFCNT_dec(on_error);
         if (on_pong) SvREFCNT_dec(on_pong);
         if (on_drain) SvREFCNT_dec(on_drain);
+        if (on_handshake) SvREFCNT_dec(on_handshake);
         croak("listen: vhost name 'default' is reserved");
     }
 
@@ -1414,6 +1515,7 @@ CODE:
     srv->on_error = on_error;
     srv->on_pong = on_pong;
     srv->on_drain = on_drain;
+    srv->on_handshake = on_handshake;
     srv->max_message_size = max_message_size;
     if (headers_hv)
         srv->response_headers = (HV*)SvREFCNT_inc(SvRV(headers_hv));
@@ -1450,6 +1552,7 @@ CODE:
         if (on_error) SvREFCNT_dec(on_error);
         if (on_pong) SvREFCNT_dec(on_pong);
         if (on_drain) SvREFCNT_dec(on_drain);
+        if (on_handshake) SvREFCNT_dec(on_handshake);
         if (srv->response_headers) SvREFCNT_dec((SV*)srv->response_headers);
         if (srv->protocol_name) Safefree(srv->protocol_name);
         Safefree(srv);
@@ -1468,6 +1571,7 @@ CODE:
         if (srv->on_error)   { SvREFCNT_dec(srv->on_error);   srv->on_error = NULL; }
         if (srv->on_pong)    { SvREFCNT_dec(srv->on_pong);    srv->on_pong = NULL; }
         if (srv->on_drain)   { SvREFCNT_dec(srv->on_drain);   srv->on_drain = NULL; }
+        if (srv->on_handshake) { SvREFCNT_dec(srv->on_handshake); srv->on_handshake = NULL; }
         if (srv->response_headers) { SvREFCNT_dec((SV*)srv->response_headers); srv->response_headers = NULL; }
         if (srv->protocol_name) {
             srv->vhost_protocols[0].name = EV_WS_PROTOCOL_NAME;
@@ -1570,15 +1674,22 @@ CODE:
     link_conn(self, RETVAL);
 
     {
-        /* Try "server" vhost first (created by listen()), fall back to "default" */
         struct lws_vhost *vh = lws_get_vhost_by_name(self->lws_ctx, "server");
-        if (!vh) vh = lws_get_vhost_by_name(self->lws_ctx, "default");
+        if (!vh) {
+            /* Auto-create a server vhost for adoption (no listener needed) */
+            struct lws_context_creation_info vinfo;
+            memset(&vinfo, 0, sizeof(vinfo));
+            vinfo.port = CONTEXT_PORT_NO_LISTEN_SERVER;
+            vinfo.protocols = protocols;
+            vinfo.vhost_name = "server";
+            vh = lws_create_vhost(self->lws_ctx, &vinfo);
+        }
         if (!vh) {
             unlink_conn(RETVAL);
             free_conn_resources(RETVAL);
             RETVAL->magic = EV_WS_CONN_FREED;
             Safefree(RETVAL);
-            croak("Cannot find default vhost for adoption");
+            croak("Failed to create vhost for adoption");
         }
         pending_adoption = RETVAL;
         if (initial_data_sv && SvOK(initial_data_sv)) {
@@ -1801,6 +1912,10 @@ CODE:
     }
 
     DEBUG_LOG("Closing connection: code=%d reason=%s", code, reason ? reason : "none");
+    if (self->in_fragmented_send) {
+        queue_send(self, NULL, 0, LWS_WRITE_CONTINUATION);
+        self->in_fragmented_send = 0;
+    }
     self->closing = 1;
     lws_close_reason(self->wsi, (enum lws_close_status)code,
                      reason ? (unsigned char*)reason : NULL,
@@ -1844,6 +1959,52 @@ send_queue_size(EV::Websockets::Connection self);
 CODE:
 {
     RETVAL = (self->magic == EV_WS_CONN_MAGIC) ? (UV)self->send_queue_bytes : 0;
+}
+OUTPUT:
+    RETVAL
+
+void
+send_fragment(EV::Websockets::Connection self, SV* data, int is_binary = 0, int is_final = 1);
+CODE:
+{
+    STRLEN len;
+    const char* buf;
+    enum lws_write_protocol mode;
+
+    if (self->magic != EV_WS_CONN_MAGIC)
+        croak("Connection has been destroyed");
+    if (!self->wsi || !self->connected || self->closing)
+        croak("Connection is not open");
+
+    buf = SvPV(data, len);
+
+    if (!self->in_fragmented_send) {
+        mode = is_binary ? LWS_WRITE_BINARY : LWS_WRITE_TEXT;
+        if (!is_final) {
+            mode |= LWS_WRITE_NO_FIN;
+            self->in_fragmented_send = 1;
+        }
+    } else {
+        mode = LWS_WRITE_CONTINUATION;
+        if (!is_final) {
+            mode |= LWS_WRITE_NO_FIN;
+        } else {
+            self->in_fragmented_send = 0;
+        }
+    }
+
+    queue_send(self, buf, len, mode);
+}
+
+SV*
+stash(EV::Websockets::Connection self);
+CODE:
+{
+    if (self->magic != EV_WS_CONN_MAGIC)
+        croak("Connection has been destroyed");
+    if (!self->stash)
+        self->stash = newHV();
+    RETVAL = newRV_inc((SV*)self->stash);
 }
 OUTPUT:
     RETVAL

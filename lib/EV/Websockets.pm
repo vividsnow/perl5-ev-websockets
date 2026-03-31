@@ -6,7 +6,7 @@ use EV;
 
 BEGIN {
     use XSLoader;
-    our $VERSION = '0.01';
+    our $VERSION = '0.05';
     XSLoader::load __PACKAGE__, $VERSION;
 }
 
@@ -31,7 +31,8 @@ sub new {
     $proxy_port //= 0;
     
     return $class->_new($loop, $proxy, $proxy_port,
-        $args{ssl_cert} // "", $args{ssl_key} // "", $args{ssl_ca} // "");
+        $args{ssl_cert} // "", $args{ssl_key} // "", $args{ssl_ca} // "",
+        exists $args{ssl_init} ? ($args{ssl_init} ? 1 : 0) : -1);
 }
 
 package EV::Websockets::Connection;
@@ -104,11 +105,17 @@ Create a new context.
         ssl_ca     => 'ca.pem',          # optional CA chain
         proxy      => '192.168.1.1',     # optional HTTP proxy host
         proxy_port => 8080,              # optional proxy port (default: 1080)
+        ssl_init   => 0,                 # optional, skip OpenSSL global init
     );
 
 If C<proxy> is not specified, the module reads C<https_proxy>, C<http_proxy>,
 or C<all_proxy> from the environment. Pass C<< proxy => "" >> to suppress
 auto-detection.
+
+C<ssl_init> controls whether libwebsockets initializes OpenSSL globals.
+By default, initialization happens once on the first context.  Pass
+C<< ssl_init => 0 >> when coexisting with another TLS library (e.g.
+Feersum/picotls) to avoid reinitializing shared OpenSSL state.
 
 =head3 connect(%options)
 
@@ -156,6 +163,7 @@ Create a WebSocket listener. Returns the port number being listened on
         ssl_ca           => 'ca.pem',   # optional CA chain
         max_message_size => 1048576,    # optional, 0 = unlimited
         headers          => { 'Set-Cookie' => 'session=abc123' }, # response headers
+        on_handshake => sub { my ($headers) = @_; return { 'X-Custom' => 'val' } },
         on_connect  => sub { my ($conn, $headers) = @_; ... },
         on_message  => sub { my ($conn, $data, $is_binary, $is_final) = @_; ... },
         on_close    => sub { my ($conn, $code, $reason) = @_; ... },
@@ -174,6 +182,13 @@ C<Path> is the request URI (e.g., C</chat>).
 
 C<headers> is an optional hashref of headers to inject into the HTTP upgrade
 response (e.g., C<Set-Cookie>).
+
+C<on_handshake> fires before the 101 response is sent
+(at C<LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION>). It receives a hashref of
+request headers (same keys as C<on_connect>). Return a hashref to inject
+per-connection response headers into the upgrade response. Return a false
+value (C<undef>, C<0>, C<"">) to reject the connection (the client receives
+a 403).
 
 =head3 connections
 
@@ -225,6 +240,28 @@ Send a Ping frame. Payload is silently truncated to 125 bytes per RFC 6455.
 =head3 send_pong($data)
 
 Send a Pong frame. Payload is silently truncated to 125 bytes per RFC 6455.
+
+=head3 send_fragment($data, $is_binary, $is_final)
+
+Send a WebSocket message fragment for streaming large messages. The first
+call starts a new fragmented message (text or binary based on C<$is_binary>).
+Subsequent calls send continuation frames. Set C<$is_final> to true on the
+last fragment.
+
+    $conn->send_fragment("part1", 0, 0);   # text, not final
+    $conn->send_fragment("part2", 0, 0);   # continuation, not final
+    $conn->send_fragment("part3", 0, 1);   # continuation, final
+
+C<$is_binary> defaults to 0, C<$is_final> defaults to 1.
+
+=head3 stash
+
+Returns a hashref for storing arbitrary per-connection metadata. The hashref
+is lazily created on first access and persists for the lifetime of the
+connection.
+
+    $conn->stash->{user_id} = 42;
+    my $uid = $conn->stash->{user_id};
 
 =head3 send_queue_size
 
@@ -280,9 +317,6 @@ Adopt WebSocket connections from a Feersum PSGI server via C<psgix.io>:
     use EV::Websockets;
 
     my $ctx = EV::Websockets::Context->new;
-    # A listener vhost is required for adopt() to work
-    $ctx->listen(port => 0, on_connect => sub {}, on_message => sub {});
-
     my $feersum = Feersum->endjinn;
     $feersum->set_psgix_io(1);
 
@@ -302,7 +336,6 @@ Adopt WebSocket connections from a Feersum PSGI server via C<psgix.io>:
         }
         $hdr .= "\r\n";
 
-        # adopt() holds a ref to $io, preventing Feersum from closing the fd
         $ctx->adopt(fh => $io, initial_data => $hdr,
             on_message => sub { $_[0]->send($_[1]) },  # echo
         );
