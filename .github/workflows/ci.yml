@@ -77,6 +77,15 @@ jobs:
         make
         make test
 
+    - name: Author tests (xt/)
+      if: runner.os == 'Linux' && matrix.perl-version == '5.40'
+      run: |
+        cpanm --notest Test::Pod Test::Pod::Coverage Test::Kwalitee \
+          Test::Spelling Test::LeakTrace || true
+        cd EV-Websockets
+        # spelling skips without a speller; autobahn skips without AUTHOR_TESTING
+        prove -lb xt/
+
   test-freebsd:
     runs-on: ubuntu-latest
     steps:
