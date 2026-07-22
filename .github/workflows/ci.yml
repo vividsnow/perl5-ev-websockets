@@ -46,6 +46,7 @@ jobs:
     - name: Install Perl Dependencies
       run: |
         cpanm --notest Alien::Build Alien::cmake3 Alien::Base::Wrapper \
+          Alien::Build::Plugin::Download::GitHub \
           Sort::Versions Mojo::DOM58 URI \
           ExtUtils::MakeMaker EV::MakeMaker \
           AnyEvent AnyEvent::WebSocket::Server
@@ -53,6 +54,9 @@ jobs:
     - name: Build and Install Alien::libwebsockets
       env:
         ALIEN_INSTALL_TYPE: share
+        # Alien::libwebsockets resolves the source tarball through the GitHub
+        # API; a token lifts the low anonymous (per-IP) rate limit.
+        ALIEN_BUILD_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         cd Alien-libwebsockets
         if [ "$RUNNER_OS" = "macOS" ]; then
@@ -108,6 +112,7 @@ jobs:
           pkg install -y cmake libev openssl perl5 p5-App-cpanminus p5-EV p5-AnyEvent p5-Net-SSLeay p5-IO-Socket-SSL
         run: |
           cpanm --notest Alien::Build Alien::cmake3 Alien::Base::Wrapper \
+            Alien::Build::Plugin::Download::GitHub \
             Sort::Versions Mojo::DOM58 URI \
             EV::MakeMaker \
             AnyEvent::WebSocket::Server
